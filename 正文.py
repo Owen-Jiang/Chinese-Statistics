@@ -3,42 +3,69 @@ import json
 import re
 import csv
 import unicodedata
-from opencc import OpenCC
 from collections import Counter
 
-cc = OpenCC('t2s')
+import typing
 
-def txtTocsv(input_file, output_file):
-    with open(input_file, "r", encoding="utf-8") as infile, \
-         open(output_file, "w", newline="", encoding="utf-8") as outfile:
-        
-        writer = csv.writer(outfile)
-        writer.writerow(["codepoint", "field", "read" if output_file == "Readings.csv" else "write"])
-        
-        for line in infile:
-            line = line.strip()
-            print(line)
-            if not line or line.startswith("#"):
-                continue  # skip comments and blank lines
-            
-            parts = line.split("\t")
-            if len(parts) == 3 and (parts[1] == "kPhonetic" or parts[1] == "kMandarin"):
-                writer.writerow(parts)
+## Output files: don't change these
+RESULT_CSV = "result/Stats.csv"
 
-    print(f"{input_file} → {output_file}")
+## Based on the Unihan data file format specs (you probably don't need to change these)
+DATAFILE_PATH = "data/Unihan_%s.txt"
+DATAFILE_DELIM = '\t'
+DATAFILE_COMMENT = '#'
+DATAFILE_BASENAMES = ['codepoint', 'prop', 'val'] # The values will get renamed according to PROPS_NAMES
+DATA_DIR = "data/%s"
+
+# Unihan data files we need (and what properties they provide of interest to us)
+SOURCES = {
+    "DictionaryLikeData": ["kPhonetic"],
+    "Readings": ["kMandarin"],
+    "Variants": ["kSimplifiedVariant"],
+}
+# What to rename each of the properties desired above [OPTIONAL]
+PROPS_NAMES = {
+    "kMandarin": "read",
+    "kPhonetic": "write",
+    "kSimplifiedVariant": "simplified",
+}
+
+# Will get populated by loadData()
+DATAFRAMES = {}
+
+def loadData():
+    global DATAFRAMES
+
+    for source in SOURCES:
+        sourceDF = pd.read_csv(DATAFILE_PATH % source, delimiter=DATAFILE_DELIM, comment=DATAFILE_COMMENT,
+                               header=None, names=DATAFILE_BASENAMES)
+        for prop in SOURCES[source]:
+            print(f"[*]\t {prop} [{source}]")
+            DATAFRAMES[prop] = sourceDF[sourceDF['prop'] == prop] \
+                .drop('prop', axis=1) \
+                .rename(columns={'val': PROPS_NAMES.get(prop, prop)}) \
+                .reset_index(drop=True)
+
+## Stage 1: Data loading
+print("[*] Loading data:")
+
+# DataFrame Reading
+loadData()
+pinyin_df = DATAFRAMES['kMandarin']
+radical_df = DATAFRAMES['kPhonetic']
+
+t2s_table = DATAFRAMES['kSimplifiedVariant']
+def t2s_convert(codepoint: str):
+    conversion = t2s_table[t2s_table['codepoint'] == codepoint]
+    if not len(conversion):
+        return codepoint
+    return conversion.iloc[0]['simplified'].split(' ')[0] # If there are multiple possible conversions, return the first
+    # (most likely) one
 
 def strip(s):
     s = s.translate(str.maketrans("ǖǘǚǜ", "vvvv"))
     normalized = unicodedata.normalize('NFD', s)
     return ''.join(ch for ch in normalized if unicodedata.category(ch) != 'Mn')
-
-# Unihan TXT to CSV
-txtTocsv("Unihan_Readings.txt", "Readings.csv")
-txtTocsv("Unihan_DictionaryLikeData.txt", "Radicals.csv")
-
-# DataFrame Reading
-pinyin_df = pd.read_csv("Readings.csv")
-radical_df = pd.read_csv("Radicals.csv")
 
 # Format pinyin_df
 pinyin_df["read"] = pinyin_df["read"].apply(strip)
@@ -49,33 +76,41 @@ pinyin_df = (pinyin_df.assign(read=pinyin_df["read"].str.split(r"[\s,]+")).explo
 
 # Format radical_df
 radical_df["write"] = radical_df["write"].astype(str).str.replace("*", "", regex=False)
-radical_df["write"] = radical_df["write"].astype(str).apply(lambda s: " ".join([w for w in s.split() if 'x' not in w]))
+radical_df["write"] = radical_df["write"].astype(str).apply(lambda s: [w for w in s.split() if 'x' not in w]) # each radical
+# may belong to multiple phonetic groups (e.g. it contains one phonetic component which is a subcomponent of another in it).
+# we want to keep these group IDs as lists, so we can group each character multiple times below.
 radical_df = radical_df.reset_index(drop=True)
 
 # Make the phonetic dictionary
-radical_df['char'] = radical_df['codepoint'].apply(lambda x: chr(int(x[2:], 16))).apply(cc.convert)
-phonetic_dict = radical_df.groupby('write')['char'].apply(list).to_dict()
+radical_df['char'] = radical_df['codepoint'].apply(t2s_convert).apply(lambda x: chr(int(x[2:], 16)))
+phonetic_dict = radical_df.explode('write').groupby('write')['char'].apply(list).to_dict()
+
+print("[+] Data loaded!")
 
 # Merge and save to 
 df = pd.merge(pinyin_df, radical_df, on="codepoint")
 
+## Stage 2: Analysis
+
 stats = (df.groupby('read')['write'].agg(lambda x: x.value_counts().idxmax()).reset_index())
 
+print("[*] Analyzing...")
+
 def mapper(ks):
-    chars = []
-    for key in str(ks).split():
+    chars_grps = []
+    for key in ks:
         key = key.strip()
         if key in phonetic_dict:
-            chars.extend(phonetic_dict[key])
-    return " ".join(chars)
+            chars_grps.append(phonetic_dict[key])
+    return " | ".join([" ".join(chars) for chars in chars_grps])
 
 stats["map"] = stats.iloc[:, 1].apply(mapper)
 
-stats.to_csv("Stats.csv", index=False)
+stats.to_csv(RESULT_CSV, index=False)
 
 # Above only takes most common by total number of characters, below scales by frequency
 
-freq_df = pd.read_csv("SUBTLEX-CH.csv", sep=",")
+freq_df = pd.read_csv(DATA_DIR % "SUBTLEX-CH.csv", sep=",")
 freq_df["Word"] = freq_df["Word"].astype(str)
 freq_df["WCount"] = pd.to_numeric(freq_df["WCount"], errors="coerce").fillna(0)
 
@@ -92,11 +127,12 @@ for _, row in freq_df.iterrows():
 
 def phonetic_sorter(row):
     read = row["read"]
-    keys = str(row["write"]).split()
+    keys = row["write"]
     info = []
 
     for k in keys:
         if k not in phonetic_dict:
+            print("[WARN]", k, "not in phonetic_dict!")
             continue
 
         chars = list(dict.fromkeys(phonetic_dict[k]))  # deduplicate
@@ -123,7 +159,7 @@ def phonetic_sorter(row):
         })
 
     return info
-
+print("[*]\t Phonetically sorting...")
 stats["correspondences"] = stats.apply(phonetic_sorter, axis=1)
 
 # Drop the temporary frequency key
@@ -161,7 +197,7 @@ stats["map"] = stats["map"].astype(str).apply(dedup_string)
 stats["correspondences"] = stats["correspondences"].apply(dedup_phonetic_info)
 
 # Save final result
-stats.to_csv("Stats.csv", index=False)
+stats.to_csv(RESULT_CSV, index=False)
 
 # Summarize below
 
@@ -212,20 +248,23 @@ def extract_summary(info_list):
 
     return pd.Series({
         "1st_write": first_key,
-        "1st_same": same,
-        "1st_different": diff,
+        "1st_same": ' '.join(same),
+        "1st_different": ' '.join(diff),
         "1st_same_len": same_len,
         "1st_different_len": diff_len,
         "1st_congruency": first_congruency,
         "most_congruency_write": best_key,
-        "most_congruency_same": best_same,
-        "most_congruency_different": best_diff,
+        "most_congruency_same": ' '.join(best_same),
+        "most_congruency_different": ' '.join(best_diff),
         "most_congruency_same_len": len(best_same),
         "most_congruency_different_len": len(best_diff),
         "most_congruency_congruency": best_congruency
     })
 
+print("[*]\t Extracting summary...")
 summary_df = stats["correspondences"].apply(extract_summary)
 stats = pd.concat([stats, summary_df], axis=1)
 
-stats.to_csv("Stats.csv", index=False)
+stats.to_csv(RESULT_CSV, index=False)
+
+print("[*] Analysis complete; saved to:", RESULT_CSV)
