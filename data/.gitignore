@@ -1,0 +1,3 @@
+# Unihan database files (latest can be pulled manually; don't
+# hog the repo)
+Unihan_*.txt
